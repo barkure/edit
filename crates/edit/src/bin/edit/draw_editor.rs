@@ -10,6 +10,7 @@ use edit::input::{kbmod, vk};
 use edit::tui::*;
 use stdext::string_from_utf8_lossy_owned;
 
+use crate::documents::GotoTarget;
 use crate::localization::*;
 use crate::state::*;
 
@@ -320,8 +321,9 @@ pub fn draw_goto_menu(ctx: &mut Context, state: &mut State) {
 
             if ctx.consume_shortcut(vk::RETURN) {
                 match validate_goto_point(&state.goto_target) {
-                    Ok(point) => {
+                    Ok(goto) => {
                         let mut buf = doc.buffer.borrow_mut();
+                        let point = goto.resolve(buf.logical_line_count());
                         buf.cursor_move_to_logical(point);
                         buf.make_cursor_visible();
                         done = true;
@@ -344,13 +346,12 @@ pub fn draw_goto_menu(ctx: &mut Context, state: &mut State) {
     }
 }
 
-fn validate_goto_point(line: &str) -> Result<Point, ParseIntError> {
-    let mut coords = [0; 2];
-    let (y, x) = line.split_once(':').unwrap_or((line, "0"));
-    // Using a loop here avoids 2 copies of the str->int code.
-    // This makes the binary more compact.
-    for (i, s) in [x, y].iter().enumerate() {
-        coords[i] = s.parse::<CoordType>()?.saturating_sub(1);
+fn validate_goto_point(line: &str) -> Result<GotoTarget, ParseIntError> {
+    let (y, x) = line.split_once(':').unwrap_or((line, "1"));
+    let y = y.parse::<CoordType>()?;
+    let x = x.parse::<CoordType>()?;
+    if x <= 0 {
+        return Err("".parse::<CoordType>().unwrap_err());
     }
-    Ok(Point { x: coords[0], y: coords[1] })
+    Ok(GotoTarget::new(y, x))
 }

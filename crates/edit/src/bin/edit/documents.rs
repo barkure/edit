@@ -25,6 +25,28 @@ pub struct Document {
     pub language_override: Option<Option<&'static Language>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GotoTarget {
+    column: CoordType,
+    line: CoordType,
+}
+
+impl GotoTarget {
+    pub fn new(line: CoordType, column: CoordType) -> Self {
+        Self { column: column.saturating_sub(1), line }
+    }
+
+    pub fn resolve(self, line_count: CoordType) -> Point {
+        let line = if self.line < 0 {
+            line_count.saturating_add(self.line)
+        } else {
+            self.line.saturating_sub(1)
+        };
+
+        Point { x: self.column, y: line.max(0) }
+    }
+}
+
 impl Document {
     pub fn save(&mut self, new_path: Option<PathBuf>) -> apperr::Result<()> {
         let path = new_path.as_deref().unwrap_or_else(|| self.path.as_ref().unwrap().as_path());
@@ -209,7 +231,9 @@ impl DocumentManager {
         if file_id.is_some() && self.update_active(|doc| doc.file_id == file_id) {
             let doc = self.active_mut().unwrap();
             if let Some(goto) = goto {
-                doc.buffer.borrow_mut().cursor_move_to_logical(goto);
+                let mut tb = doc.buffer.borrow_mut();
+                let goto = goto.resolve(tb.logical_line_count());
+                tb.cursor_move_to_logical(goto);
             }
             return Ok(doc);
         }
@@ -220,10 +244,11 @@ impl DocumentManager {
                 let mut tb = buffer.borrow_mut();
                 tb.read_file(file, None)?;
 
-                if let Some(goto) = goto
-                    && goto != Default::default()
-                {
-                    tb.cursor_move_to_logical(goto);
+                if let Some(goto) = goto {
+                    let goto = goto.resolve(tb.logical_line_count());
+                    if goto != Default::default() {
+                        tb.cursor_move_to_logical(goto);
+                    }
                 }
             }
         }
@@ -291,21 +316,29 @@ impl DocumentManager {
 
     // Parse a filename in the form of "filename:line:char".
     // Returns the position of the first colon and the line/char coordinates.
-    fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>) {
-        fn parse(s: &[u8]) -> Option<CoordType> {
+    fn parse_filename_goto(path: &Path) -> (&Path, Option<GotoTarget>) {
+        fn parse(s: &[u8], allow_negative: bool) -> Option<CoordType> {
             if s.is_empty() {
                 return None;
             }
 
+            let (negative, digits) = match s {
+                [b'-', rest @ ..] if allow_negative => (true, rest),
+                _ => (false, s),
+            };
+            if digits.is_empty() {
+                return None;
+            }
+
             let mut num: CoordType = 0;
-            for &b in s {
+            for &b in digits {
                 if !b.is_ascii_digit() {
                     return None;
                 }
                 let digit = (b - b'0') as CoordType;
                 num = num.checked_mul(10)?.checked_add(digit)?;
             }
-            Some(num)
+            Some(if negative { -num } else { num })
         }
 
         fn find_colon_rev(bytes: &[u8], offset: usize) -> Option<usize> {
@@ -320,24 +353,22 @@ impl DocumentManager {
             _ => return (path, None),
         };
 
-        let last = match parse(&bytes[colend + 1..]) {
-            Some(last) => last,
-            None => return (path, None),
-        };
-        let last = (last - 1).max(0);
         let mut len = colend;
-        let mut goto = Point { x: 0, y: last };
-
-        if let Some(colbeg) = find_colon_rev(bytes, colend) {
-            // Same here: Don't allow empty filenames.
-            if colbeg != 0
-                && let Some(first) = parse(&bytes[colbeg + 1..colend])
-            {
-                let first = (first - 1).max(0);
-                len = colbeg;
-                goto = Point { x: last, y: first };
-            }
-        }
+        let goto = if let Some(colbeg) = find_colon_rev(bytes, colend)
+            && colbeg != 0
+            && let Some(line) = parse(&bytes[colbeg + 1..colend], true)
+        {
+            let Some(column) = parse(&bytes[colend + 1..], false) else {
+                return (path, None);
+            };
+            len = colbeg;
+            GotoTarget::new(line, column)
+        } else {
+            let Some(line) = parse(&bytes[colend + 1..], true) else {
+                return (path, None);
+            };
+            GotoTarget::new(line, 1)
+        };
 
         // Strip off the :line:char suffix.
         let path = &bytes[..len];
@@ -353,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_parse_last_numbers() {
-        fn parse(s: &str) -> (&str, Option<Point>) {
+        fn parse(s: &str) -> (&str, Option<GotoTarget>) {
             let (p, g) = DocumentManager::parse_filename_goto(Path::new(s));
             (p.to_str().unwrap(), g)
         }
@@ -361,20 +392,24 @@ mod tests {
         assert_eq!(parse("123"), ("123", None));
         assert_eq!(parse("abc"), ("abc", None));
         assert_eq!(parse(":123"), (":123", None));
-        assert_eq!(parse("abc:123"), ("abc", Some(Point { x: 0, y: 122 })));
-        assert_eq!(parse("45:123"), ("45", Some(Point { x: 0, y: 122 })));
-        assert_eq!(parse(":45:123"), (":45", Some(Point { x: 0, y: 122 })));
-        assert_eq!(parse("abc:45:123"), ("abc", Some(Point { x: 122, y: 44 })));
-        assert_eq!(parse("abc:def:123"), ("abc:def", Some(Point { x: 0, y: 122 })));
-        assert_eq!(parse("1:2:3"), ("1", Some(Point { x: 2, y: 1 })));
-        assert_eq!(parse("::3"), (":", Some(Point { x: 0, y: 2 })));
-        assert_eq!(parse("1::3"), ("1:", Some(Point { x: 0, y: 2 })));
+        assert_eq!(parse("abc:123"), ("abc", Some(GotoTarget::new(123, 1))));
+        assert_eq!(parse("45:123"), ("45", Some(GotoTarget::new(123, 1))));
+        assert_eq!(parse(":45:123"), (":45", Some(GotoTarget::new(123, 1))));
+        assert_eq!(parse("abc:45:123"), ("abc", Some(GotoTarget::new(45, 123))));
+        assert_eq!(parse("abc:def:123"), ("abc:def", Some(GotoTarget::new(123, 1))));
+        assert_eq!(parse("1:2:3"), ("1", Some(GotoTarget::new(2, 3))));
+        assert_eq!(parse("::3"), (":", Some(GotoTarget::new(3, 1))));
+        assert_eq!(parse("1::3"), ("1:", Some(GotoTarget::new(3, 1))));
         assert_eq!(parse(""), ("", None));
         assert_eq!(parse(":"), (":", None));
         assert_eq!(parse("::"), ("::", None));
-        assert_eq!(parse("a:1"), ("a", Some(Point { x: 0, y: 0 })));
+        assert_eq!(parse("a:1"), ("a", Some(GotoTarget::new(1, 1))));
         assert_eq!(parse("1:a"), ("1:a", None));
-        assert_eq!(parse("file.txt:10"), ("file.txt", Some(Point { x: 0, y: 9 })));
-        assert_eq!(parse("file.txt:10:5"), ("file.txt", Some(Point { x: 4, y: 9 })));
+        assert_eq!(parse("file.txt:10"), ("file.txt", Some(GotoTarget::new(10, 1))));
+        assert_eq!(parse("file.txt:10:5"), ("file.txt", Some(GotoTarget::new(10, 5))));
+        assert_eq!(parse("file.txt:-1"), ("file.txt", Some(GotoTarget::new(-1, 1))));
+        assert_eq!(parse("file.txt:-5"), ("file.txt", Some(GotoTarget::new(-5, 1))));
+        assert_eq!(parse("file.txt:-10:5"), ("file.txt", Some(GotoTarget::new(-10, 5))));
+        assert_eq!(parse("file.txt:10:-5"), ("file.txt:10:-5", None));
     }
 }
