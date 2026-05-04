@@ -10,7 +10,6 @@ use edit::input::{kbmod, vk};
 use edit::tui::*;
 use stdext::string_from_utf8_lossy_owned;
 
-use crate::documents::GotoTarget;
 use crate::localization::*;
 use crate::state::*;
 
@@ -323,8 +322,12 @@ pub fn draw_goto_menu(ctx: &mut Context, state: &mut State) {
                 match validate_goto_point(&state.goto_target) {
                     Ok(goto) => {
                         let mut buf = doc.buffer.borrow_mut();
-                        let point = goto.resolve(buf.logical_line_count());
-                        buf.cursor_move_to_logical(point);
+                        let line = if goto.y < 0 {
+                            buf.logical_line_count().saturating_add(goto.y)
+                        } else {
+                            goto.y.saturating_sub(1)
+                        };
+                        buf.cursor_move_to_logical(Point { x: goto.x, y: line.max(0) });
                         buf.make_cursor_visible();
                         done = true;
                     }
@@ -346,12 +349,12 @@ pub fn draw_goto_menu(ctx: &mut Context, state: &mut State) {
     }
 }
 
-fn validate_goto_point(line: &str) -> Result<GotoTarget, ParseIntError> {
+fn validate_goto_point(line: &str) -> Result<Point, ParseIntError> {
     let (y, x) = line.split_once(':').unwrap_or((line, "1"));
     let y = y.parse::<CoordType>()?;
     let x = x.parse::<CoordType>()?;
     if x <= 0 {
         return Err("".parse::<CoordType>().unwrap_err());
     }
-    Ok(GotoTarget::new(y, x))
+    Ok(Point { x: x.saturating_sub(1), y })
 }
